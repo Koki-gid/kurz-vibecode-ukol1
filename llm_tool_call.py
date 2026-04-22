@@ -8,7 +8,7 @@ import os
 import sys
 from typing import Any
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 
 
 def calculate(operation: str, a: float, b: float) -> str:
@@ -43,6 +43,18 @@ def run_tool(name: str, arguments: dict[str, Any]) -> str:
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
+def format_tool_result(tool_result: str) -> str:
+    """Convert JSON tool output into a plain Czech summary for the model."""
+    parsed = json.loads(tool_result)
+    if "error" in parsed:
+        return f"Nastroj vratil chybu: {parsed['error']}"
+    return (
+        "Nastroj calculate vratil tento vysledek: "
+        f"operace {parsed['operation']}, cislo A {parsed['a']}, "
+        f"cislo B {parsed['b']}, vysledek {parsed['result']}."
+    )
+
+
 def get_final_text(response: Any) -> str:
     """Return text output in a way that survives small SDK response changes."""
     output_text = getattr(response, "output_text", None)
@@ -69,7 +81,8 @@ def main() -> int:
         print("Missing OPENAI_API_KEY environment variable.")
         return 1
 
-    client = OpenAI()
+    timeout = float(os.getenv("OPENAI_TIMEOUT", "60"))
+    client = OpenAI(timeout=timeout)
     model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
     user_prompt = sys.argv[1]
 
@@ -102,37 +115,68 @@ def main() -> int:
         }
     ]
 
-    response = client.responses.create(
-        model=model,
-        input=user_prompt,
-        tools=tools,
-        instructions=(
-            "If arithmetic is needed, call the calculate tool. "
-            "After receiving the tool result, answer clearly in Czech."
-        ),
-    )
-
-    tool_outputs: list[dict[str, str]] = []
-    for item in response.output:
-        if item.type != "function_call":
-            continue
-
-        arguments = json.loads(item.arguments)
-        result = run_tool(item.name, arguments)
-        tool_outputs.append(
-            {
-                "type": "function_call_output",
-                "call_id": item.call_id,
-                "output": result,
-            }
-        )
-
-    if tool_outputs:
+    try:
         response = client.responses.create(
             model=model,
-            previous_response_id=response.id,
-            input=tool_outputs,
+            input=user_prompt,
+            tools=tools,
+            instructions=(
+                "If arithmetic is needed, call the calculate tool. "
+                "Use the tool result to produce the final answer in Czech. "
+                "Do not stop after the tool call."
+            ),
         )
+
+        while True:
+            tool_outputs: list[dict[str, str]] = []
+            tool_summaries: list[str] = []
+            for item in response.output:
+                if item.type != "function_call":
+                    continue
+
+                arguments = json.loads(item.arguments)
+                result = run_tool(item.name, arguments)
+                tool_summaries.append(format_tool_result(result))
+                tool_outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": item.call_id,
+                        "output": result,
+                    }
+                )
+
+            if not tool_outputs:
+                break
+
+            response = client.responses.create(
+                model=model,
+                previous_response_id=response.id,
+                input=tool_outputs
+                + [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": (
+                            "Pouzij vysledek nastroje a odpovez uzivateli cesky "
+                            "jednou kratkou vetou bez JSONu. "
+                            + " ".join(tool_summaries)
+                        ),
+                    }
+                ],
+            )
+    except APITimeoutError:
+        print(
+            "Request timed out while connecting to the OpenAI API. "
+            "Try again, check your internet connection, or set a longer timeout "
+            "for example: export OPENAI_TIMEOUT=120"
+        )
+        return 1
+    except APIConnectionError:
+        print(
+            "Could not connect to the OpenAI API. "
+            "Check your internet connection and API access, then try again."
+        )
+        return 1
 
     print(get_final_text(response))
     return 0
